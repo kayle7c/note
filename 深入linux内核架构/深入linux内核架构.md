@@ -122,8 +122,68 @@ char domainname[65];
 
     系统的就绪队列都在runqueues数组中，数组中每个元素对应一个cpu，如果只有一个cpu的话数组中就只有一个元素。
 
-
-
     优先级：进程的nice值在20和+19之间（包含）。值越低，表明优先级越高。
 
 ![](img/2025-04-02-15-29-33-image.png)
+
+
+
+## 内存管理
+
+    有两种计算机，分别以不同的方式管理内存
+
+    1.UMA计算机（一致性内存），将可用内存以连续方式组织起来
+
+<img src="img/2025-04-10-10-26-57-image.png" title="" alt="" data-align="center">
+
+    2.NUMA计算机（非一致性内存），每个cpu都有自己的内存，可以快速访问，cpu也可以访问不属于自己的内存，但是访问速度会慢一些。 
+
+<img title="" src="img/2025-04-10-10-27-29-image.png" alt="" data-align="center">
+
+    内存模型分为三种：平坦模型，不连续模型，稀疏模型。
+
+    ![](img/2025-04-10-10-43-18-image.png)
+
+### (N)UMA 模型中的内存组织
+
+    在UMA系统上，只使用一个NUMA结点来管理整个系统内存。而内存管理的其他部分则相信它们是在处理一个伪NUMA系统。
+
+    内存划分为节点，每个节点关联到系统的一个处理器，在内核中表示为pg_data_t的实
+例，每个节点又划分为内存域，将内存进一步划分（在UMA系统上，对应的只有一个pg_data_t）,各个内存域都关联了一个数组，用来组织属于该内存域的物理内存页（内核中称之为页帧）。对每个页帧，都分配了一个struct page实例以及所需的管理数据。
+
+<img src="img/2025-04-10-10-50-26-image.png" title="" alt="" data-align="center">
+
+pg_data_t是用于表示结点的基本元素:
+
+```c
+<mmzone.h> 
+typedef struct pglist_data { 
+struct zone node_zones[MAX_NR_ZONES]; 
+struct zonelist node_zonelists[MAX_ZONELISTS]; 
+int nr_zones; 
+struct page *node_mem_map; 
+struct bootmem_data *bdata; 
+unsigned long node_start_pfn; 
+unsigned long node_present_pages; /* 物理内存页的总数 */ 
+unsigned long node_spanned_pages; /* 物理内存页的总长度，包含洞在内 */ 
+int node_id; 
+struct pglist_data *pgdat_next; 
+wait_queue_head_t kswapd_wait; 
+struct task_struct *kswapd; 
+int kswapd_max_order; 
+} pg_data_t; 
+```
+
++ node_zones是一个数组，包含了结点中各内存域的数据结构
+
++ node_zonelists指定了备用结点及其内存域的列表，以便在当前结点没有可用空间时，在备用结点分配内存
+
++ 结点中不同内存域的数目保存在nr_zones
+
++ node_mem_map是指向page实例数组的指针，用于描述结点的所有物理内存页。它包含了结点中所有内存域的页
+
++ node_start_pfn是该NUMA结点第一个页帧的逻辑编号。系统中所有结点的页帧是依次编号的，每个页帧的号码都是全局唯一的。node_start_pfn在UMA系统中总是0，因为在UMA系统中只有一个节点，所以第一个页帧编号总是0
+
++ node_id是全局结点ID。系统中的NUMA结点都从0开始编号
+
++ pgdat_next连接到下一个内存结点，系统中所有结点都通过单链表连接起来，其末尾通过空指针标记
