@@ -126,8 +126,6 @@ char domainname[65];
 
 ![](img/2025-04-02-15-29-33-image.png)
 
-
-
 ## 内存管理
 
     有两种计算机，分别以不同的方式管理内存
@@ -187,3 +185,103 @@ int kswapd_max_order;
 + node_id是全局结点ID。系统中的NUMA结点都从0开始编号
 
 + pgdat_next连接到下一个内存结点，系统中所有结点都通过单链表连接起来，其末尾通过空指针标记
+
+### 内存域
+
+    内核使用zone结构来描述内存域
+
+```c
+struct zone { 
+/*通常由页分配器访问的字段 */
+unsigned long pages_min, pages_low, pages_high;
+unsigned long lowmem_reserve[MAX_NR_ZONES];
+struct per_cpu_pageset pageset[NR_CPUS];
+/*
+* 不同长度的空闲区域
+*/
+spinlock_t lock;
+struct free_area free_area[MAX_ORDER];
+ZONE_PADDING(_pad1_)
+/* 通常由页面收回扫描程序访问的字段 */
+spinlock_t lru_lock;
+struct list_head active_list;
+struct list_head inactive_list;
+unsigned long nr_scan_active;
+unsigned long nr_scan_inactive;
+unsigned long pages_scanned; /* 上一次回收以来扫描过的页 */
+unsigned long flags; /* 内存域标志，见下文 */
+/* 内存域统计量 */
+atomic_long_t vm_stat[NR_VM_ZONE_STAT_ITEMS];
+int prev_priority;
+ZONE_PADDING(_pad2_)
+/* 很少使用或大多数情况下只读的字段 */
+wait_queue_head_t * wait_table;
+unsigned long wait_table_hash_nr_entries;
+unsigned long wait_table_bits;
+/* 支持不连续内存模型的字段。 */
+struct pglist_data *zone_pgdat;
+unsigned long zone_start_pfn;
+unsigned long spanned_pages; /* 总长度，包含空洞 */
+unsigned long present_pages; /* 内存数量（除去空洞） */
+/*
+* 很少使用的字段：
+*/
+ char *name;
+} ____cacheline_maxaligned_in_smp; 
+```
+
++ pages_min、pages_high、pages_low是页换出时使用的“水线”，如果内存不足，内核可
+  以将页写到硬盘。如果空闲页多于pages_high，则内存域的状态是理想的；如果空闲页的数目低于pages_low，则内核开始将页换出到硬盘；如果空闲页的数目低于pages_min，那么页回收工作的压力就比较大，因为内存域中急需空闲页。
+
++ pageset是一个数组，用于实现每个CPU的热/冷页帧列表。内核使用这些列表来保存可用于满足实现的“新鲜”页。但冷热页帧对应的高速缓存状态不同：有些页帧也很可能仍然在高速缓存中，因此可以快速访问，故称之为热的；未缓存的页帧与此相对，故称之为冷的。
+
++ active_list是活动页的集合，而inactive_list则不活动页的集合（page实例）。
+
++ flags描述内存域的当前状态，有三种状态：
+  
+  ```c
+  typedef enum {
+  ZONE_ALL_UNRECLAIMABLE, /* 所有的页都已经“钉”住 */ 
+  ZONE_RECLAIM_LOCKED, /* 防止并发回收 */ 
+  ZONE_OOM_LOCKED, /* 内存域即可被回收 */ 
+  } zone_flags_t; 
+  ```
+  
+  ZONE_ALL_UNRECLAIMABLE:当用户程序使用mlock系统调用通知内核页不能从物理内存上移出，这样的页被称为钉住的。如果一个内存域中的所有页都被钉住，那么该内存域是无法回收的，即设置该标志。为不浪费时间，交换守护进程在寻找可供回收的页时，只会简要地扫描一下此类内存域。
+  
+  ZONE_RECLAIM_LOCKED：在SMP系统上，多个CPU可能试图并发地回收一个内存域。该标志可防止这种情况：如果一个CPU在回收某个内存域，则设置该标志。这防止了其他CPU的尝试。
+  
+  ZONE_OOM_LOCKED：用于某种不走运的情况：如果进程消耗了大量的内存，致使必要的操作都无法完成，那么内核会试图杀死消耗内存最多的进程，以获得更多的空闲页。该标志可以防止多个CPU同时进行这种操作。
+
++ 内存域和父结点之间的关联由zone_pgdat建立，zone_pgdat指向对应的pglist_data实例
+
++ zone_start_pfn是内存域第一个页帧的索引
+
+### 冷热页
+
+    struct zone的pageset成员用于实现冷热分配器（hot-n-cold allocator）。pageset是一个数组，其容量与系统能够容纳的CPU数目的最大值相同。
+
+    数组元素的类型为per_cpu_pageset，定义如下：
+
+```c
+<mmzone.h> 
+struct per_cpu_pageset {     
+struct per_cpu_pages pcp[2]; /* 索引0对应热页，索引1对应冷页 */ 
+} ____cacheline_aligned_in_smp; 
+```
+
+    该结构由一个带有两个数组项的数组构成，第一项管理热页，第二项管理冷页。具体的数据在per_cpu_pages中：
+
+```c
+<mmzone.h> 
+struct per_cpu_pages { 
+int count; /* 列表中页数 */ 
+int high; /* 页数上限水印，在需要的情况下清空列表 */ 
+int batch; /* 添加/删除多页块的时候，块的大小 */ 
+struct list_head list; /* 页的链表 */ 
+}; 
+```
+
+    count记录了与该列表相关的页的数目，high是一个水印。如果count的值超出了high，则表明列表中的页太多了。list是一个双链表，保存了当前CPU的冷页或热页，可使用内核的标准方法处理。如有可能，CPU的高速缓存不是用单个页来填充的，而是用多个页组成的块。batch是每次添加页数的一个参考值
+
+<img src="img/2025-04-11-11-33-04-image.png" title="" alt="" data-align="center">
