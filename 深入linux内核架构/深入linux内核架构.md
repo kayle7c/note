@@ -480,7 +480,7 @@ struct free_area {
 
 ​	在2.6之后通过free_area_init_nodes就可以生成相关数据结构
 
-![image-20250429103928491](E:\学习\内核笔记\note-master\note-master\深入linux内核架构\img\image-20250429103928491.png)
+![image-20250429103928491](E:\学习\内核笔记\深入linux内核架构\img\image-20250429103928491.png)
 
 
 
@@ -527,7 +527,7 @@ static unsigned long __meminitdata arch_zone_highest_possible_pfn[MAX_NR_ZONES];
 
 ​	mask掩码如下：
 
-![image-20250429111400303](E:\学习\内核笔记\note-master\note-master\深入linux内核架构\img\image-20250429111400303.png)
+![image-20250429111400303](E:\学习\内核笔记\深入linux内核架构\img\image-20250429111400303.png)
 
 ​	与内存域修饰符相反，这些额外的标志并不限制从哪个物理内存段分配内存，但确实可以改变分配器的行为。例如，它们可以修改查找空闲内存时的积极程度。
 
@@ -589,7 +589,7 @@ static unsigned long __meminitdata arch_zone_highest_possible_pfn[MAX_NR_ZONES];
 
   除了这些标志以外，内核还提供了组合标志：
 
-![image-20250429111919767](E:\学习\内核笔记\note-master\note-master\深入linux内核架构\img\image-20250429111919767.png)
+![image-20250429111919767](E:\学习\内核笔记\深入linux内核架构\img\image-20250429111919767.png)
 
 + GFP_ATOMIC用于原子分配，在任何情况下都不能中断，可能使用 紧急分配链表中的内存。GFP_NOIO和GFP_NOFS分别明确禁止I/O操作和访问VFS层，但同时设 置了__GFP_WAIT，因此可以被中断。
 + GFP_KERNEL和GFP_USER分别是内核和用户分配的默认设置。二者的失败不会立即威胁系统稳定性。GFP_KERNEL绝对是内核源代码中最常使用的标志。
@@ -629,7 +629,7 @@ fastcall unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)
 
 ​	所有api函数到公共的基础函数alloc_pages的统一：
 
-![image-20250429112658390](E:\学习\内核笔记\note-master\note-master\深入linux内核架构\img\image-20250429112658390.png)
+![image-20250429112658390](E:\学习\内核笔记\深入linux内核架构\img\image-20250429112658390.png)
 
 ​	类似的内存的释放也可以归约到一个主要的函数（__free_pages）
 
@@ -653,12 +653,163 @@ void free_pages(unsigned long addr, unsigned int order)
 
 ​	各个释放函数之间的关系。
 
-![image-20250429113052929](E:\学习\内核笔记\note-master\note-master\深入linux内核架构\img\image-20250429113052929.png)
+![image-20250429113052929](E:\学习\内核笔记\深入linux内核架构\img\image-20250429113052929.png)
 
 
-=======
+
 
 + 可回收页：不能直接移动，但可以删除，其内容可以从某些源重新生成。例如，映射自文件的数据属于该类别
 
 + 可移动页可以随意地移动。属于用户空间应用程序的页属于该类别。它们是通过页表映射的。如果它们复制到新位置，页表项可以相应地更新，应用程序不会注意到任何事。
->>>>>>> a8e8629498b2a770d657ac967247dc6745ae434f
+
+#### 分配页
+
+​	所有API函数都追溯到alloc_pages_node，从某种意义上说，该函数是伙伴系统主要实现的“发射台”。
+
+```c
+<gfp.h>  
+static inline struct page *alloc_pages_node(int nid, gfp_t gfp_mask,
+						unsigned int order)
+{
+	if (unlikely(order >= MAX_ORDER))
+		return NULL;
+
+	/* Unknown node is current node */
+	if (nid < 0)
+		nid = numa_node_id();
+
+	return __alloc_pages(gfp_mask, order,
+		NODE_DATA(nid)->node_zonelists + gfp_zone(gfp_mask));
+}
+```
+
+​	内核源代码将__alloc_pages称之为“伙伴系统的心脏”，因为它处理的是实质性的内存分配。
+
+​	在__alloc_pages中，申请页面主要为：
+
+```c
+page = get_page_from_freelist(gfp_mask|__GFP_HARDWALL, order,
+				zonelist, ALLOC_WMARK_LOW|ALLOC_CPUSET);
+```
+
+​	get_page_from_freelist是伙伴系统使用的另一个重要的辅助函数。它通过标志集和分配阶来 判断是否能进行分配。如果可以，则发起实际的分配操作
+
+```
+static struct page *
+get_page_from_freelist(gfp_t gfp_mask, unsigned int order,
+		struct zonelist *zonelist, int alloc_flags)
+{
+	struct zone **z;
+	struct page *page = NULL;
+	int classzone_idx = zone_idx(zonelist->zones[0]);
+	struct zone *zone;
+	nodemask_t *allowednodes = NULL;/* zonelist_cache approximation */
+	int zlc_active = 0;		/* set if using zonelist_cache */
+	int did_zlc_setup = 0;		/* just call zlc_setup() one time */
+	enum zone_type highest_zoneidx = -1; /* Gets set for policy zonelists */
+
+zonelist_scan:
+	/*
+	 * Scan zonelist, looking for a zone with enough free.
+	 * See also cpuset_zone_allowed() comment in kernel/cpuset.c.
+	 */
+	z = zonelist->zones;
+
+	do {
+		/*
+		 * In NUMA, this could be a policy zonelist which contains
+		 * zones that may not be allowed by the current gfp_mask.
+		 * Check the zone is allowed by the current flags
+		 */
+		if (unlikely(alloc_should_filter_zonelist(zonelist))) {
+			if (highest_zoneidx == -1)
+				highest_zoneidx = gfp_zone(gfp_mask);
+			if (zone_idx(*z) > highest_zoneidx)
+				continue;
+		}
+
+		if (NUMA_BUILD && zlc_active &&
+			!zlc_zone_worth_trying(zonelist, z, allowednodes))
+				continue;
+		zone = *z;
+		if ((alloc_flags & ALLOC_CPUSET) &&
+			!cpuset_zone_allowed_softwall(zone, gfp_mask))
+				goto try_next_zone;
+
+		if (!(alloc_flags & ALLOC_NO_WATERMARKS)) {
+			unsigned long mark;
+			if (alloc_flags & ALLOC_WMARK_MIN)
+				mark = zone->pages_min;
+			else if (alloc_flags & ALLOC_WMARK_LOW)
+				mark = zone->pages_low;
+			else
+				mark = zone->pages_high;
+			if (!zone_watermark_ok(zone, order, mark,
+				    classzone_idx, alloc_flags)) {
+				if (!zone_reclaim_mode ||
+				    !zone_reclaim(zone, gfp_mask, order))
+					goto this_zone_full;
+			}
+		}
+
+		page = buffered_rmqueue(zonelist, zone, order, gfp_mask); //如果内存域适用于当前的分配请求，那么buffered_rmqueue试图从中分配所需数目的页
+		if (page)
+			break;
+this_zone_full:
+		if (NUMA_BUILD)
+			zlc_mark_zone_full(zonelist, z);
+try_next_zone:
+		if (NUMA_BUILD && !did_zlc_setup) {
+			/* we do zlc_setup after the first zone is tried */
+			allowednodes = zlc_setup(zonelist, alloc_flags);
+			zlc_active = 1;
+			did_zlc_setup = 1;
+		}
+	} while (*(++z) != NULL);
+
+	if (unlikely(NUMA_BUILD && page == NULL && zlc_active)) {
+		/* Disable zlc cache for second zonelist scan */
+		zlc_active = 0;
+		goto zonelist_scan;
+	}
+	return page;
+}
+
+```
+
+
+
+​	zone_watermark_ok检查所遍历到的内存域是否有足够的空闲页，并试图分配一个连续内存块。
+
+```c
+int zone_watermark_ok(struct zone *z, int order, unsigned long mark,
+		      int classzone_idx, int alloc_flags)
+{
+	/* free_pages my go negative - that's OK */
+	long min = mark;
+	long free_pages = zone_page_state(z, NR_FREE_PAGES) - (1 << order) + 1;
+	int o;
+
+	if (alloc_flags & ALLOC_HIGH)
+		min -= min / 2;
+	if (alloc_flags & ALLOC_HARDER)
+		min -= min / 4;
+
+	if (free_pages <= min + z->lowmem_reserve[classzone_idx])
+		return 0;
+	for (o = 0; o < order; o++) {
+		/* At the next order, this order's pages become unavailable */
+		free_pages -= z->free_area[o].nr_free << o;
+
+		/* Require fewer higher order pages to be free */
+		min >>= 1;
+
+		if (free_pages <= min)
+			return 0;
+	}
+	return 1;
+}
+```
+
+​	如果满足则会调用buffered_rmqueue试图从中分配所需数目的页，如果分配成功，则将页返回给调用者。否则， 进入下一个循环，选择备用列表中的下一个内存域。
+
